@@ -1,0 +1,16 @@
+yt-dlp>=2025.1.1
+chat-downloader>=0.2.8
+curl_cffi>=0.7
+librosa>=0.10
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
+faster-whisper>=1.0
+requests>=2.31
+opencv-python>=4.9
+mediapipe>=0.10
+pysubs2>=1.7
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.1
+tiktok-uploader>=1.2
+rich>=13

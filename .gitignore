@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Segredos e credenciais (NUNCA versionar)
+client_secrets.json
+token.json
+tiktok_cookies.txt
+cookies.txt
+.env
+.env.*
+
+# Saídas geradas (vídeos, áudios, cortes, logs)
+output/
+
+# Modelos baixados automaticamente
+models/
+
+
+# Mídia solta
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.part
+*.ytdl
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

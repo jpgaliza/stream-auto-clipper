@@ -30,7 +30,7 @@ não precisa instalar nada no sistema.
 ### Windows (PowerShell)
 
 ```powershell
-git clone <URL-DO-SEU-REPOSITORIO> stream-auto-clipper
+git clone https://github.com/jpgaliza/stream-auto-clipper.git stream-auto-clipper
 cd stream-auto-clipper
 
 python -m venv .venv
@@ -51,7 +51,7 @@ ollama pull qwen2.5vl:7b                 # opcional: só se usar --verify
 ### Linux (Debian/Ubuntu; adapte o gerenciador de pacotes)
 
 ```bash
-git clone <URL-DO-SEU-REPOSITORIO> stream-auto-clipper
+git clone https://github.com/jpgaliza/stream-auto-clipper.git stream-auto-clipper
 cd stream-auto-clipper
 
 sudo apt update && sudo apt install -y python3-venv python3-pip ffmpeg
@@ -72,7 +72,7 @@ ollama pull qwen2.5vl:7b                 # opcional: só se usar --verify
 ### macOS (Homebrew)
 
 ```bash
-git clone <URL-DO-SEU-REPOSITORIO> stream-auto-clipper
+git clone https://github.com/jpgaliza/stream-auto-clipper.git stream-auto-clipper
 cd stream-auto-clipper
 
 brew install python ffmpeg git

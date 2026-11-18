@@ -55,14 +55,59 @@ def require_ffmpeg() -> None:
 
 
 # ------------------------------------------------------------------ download
-def download_video(url: str, workdir: Path, cookies: str | None) -> Path:
+def probe_duration(url: str, cookies: str | None) -> float | None:
+    cmd = ytdlp_base(cookies) + ["--print", "duration", "--no-playlist", url]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        try:
+            return float(line.strip())
+        except ValueError:
+            continue
+    return None
+
+
+def parse_hms(val: str) -> float:
+    """Converte 'HH:MM:SS', 'MM:SS' ou segundos ('3600') em float de segundos."""
+    parts = val.strip().split(":")
+    if len(parts) == 1:
+        return float(parts[0])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    raise ValueError(f"Tempo inválido: {val}")
+
+
+def download_video(url: str, workdir: Path, cookies: str | None,
+                   last_minutes: float | None = None,
+                   section: str | None = None,
+                   duration_override: float | None = None) -> tuple[Path, float, float | None]:
     out_tpl = str(workdir / "video.%(ext)s")
+    slice_start, slice_end = 0.0, None
+    extra: list[str] = []
+    if section:
+        raw_s, _, raw_e = section.partition("-")
+        slice_start = parse_hms(raw_s) if raw_s.strip() else 0.0
+        slice_end = parse_hms(raw_e) if raw_e.strip() else (probe_duration(url, cookies) or duration_override)
+        end_tok = f"{slice_end:.0f}" if slice_end else "inf"
+        extra = ["--download-sections", f"*{slice_start:.0f}-{end_tok}"]
+        print(f"  Baixando trecho {slice_start:.0f}s - {end_tok}s...")
+    elif last_minutes and last_minutes > 0:
+        total_s = probe_duration(url, cookies) or duration_override
+        if total_s and total_s > last_minutes * 60.0:
+            slice_start = total_s - last_minutes * 60.0
+            slice_end = total_s
+            extra = ["--download-sections", f"*{slice_start:.0f}-{total_s:.0f}"]
+            print(f"  Baixando apenas os últimos {last_minutes:g} min ({slice_start:.0f}s - {total_s:.0f}s)...")
     cmd = ytdlp_base(cookies) + [
         "-f", config.DOWNLOAD_FORMAT,
         "-S", "res:1080,fps:60",
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--write-info-json",
+        *extra,
         "-o", out_tpl,
         url,
     ]
@@ -74,7 +119,7 @@ def download_video(url: str, workdir: Path, cookies: str | None) -> Path:
         if not cands:
             sys.exit("Download falhou: nenhum arquivo de vídeo gerado.")
         video = cands[0]
-    return video
+    return video, slice_start, slice_end
 
 
 def extract_audio(video: Path, wav: Path) -> None:
@@ -191,41 +236,48 @@ def _kick_fetch_chunk(channel_id: int, start_epoch: float, c_start: float, c_end
     return out
 
 
-def download_kick_chat(url: str, duration_hint: float | None = None) -> list[dict]:
+def download_kick_chat(url: str, duration_hint: float | None = None,
+                       slice_start: float = 0.0, slice_end: float | None = None,
+                       kick_meta: tuple[int, float, float] | None = None) -> list[dict]:
     """Coletor dedicado de chat replay para VODs da Kick via API + curl_cffi."""
-    m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", url, re.I)
-    if not m:
-        print("  ! URL da Kick sem UUID de VOD; pulando chat.")
-        return []
-    try:
-        from curl_cffi import requests
-    except ImportError:
-        print("  ! curl_cffi não instalado; pulando chat da Kick.")
-        return []
-
-    uuid = m.group(1)
-    try:
-        s = requests.Session(impersonate="chrome")
-        resp = s.get(f"https://kick.com/api/v1/video/{uuid}", timeout=15)
-        if resp.status_code != 200:
-            print(f"  ! Kick API retornou HTTP {resp.status_code}; pulando chat.")
+    if kick_meta is not None:
+        channel_id, start_epoch, dur_s = kick_meta
+        duration_s = dur_s or (duration_hint or 0.0)
+    else:
+        m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", url, re.I)
+        if not m:
+            print("  ! URL da Kick sem UUID de VOD; pulando chat.")
             return []
-        meta = resp.json()
-        ls = meta.get("livestream") or {}
-        channel_id = ls.get("channel_id")
-        start_str = ls.get("start_time")
-        duration_s = float(ls.get("duration") or 0) / 1000.0 or (duration_hint or 0.0)
-        if not channel_id or not start_str or duration_s <= 0:
-            print("  ! Metadados da live Kick incompletos; pulando chat.")
+        try:
+            from curl_cffi import requests
+        except ImportError:
+            print("  ! curl_cffi não instalado; pulando chat da Kick.")
             return []
-        start_epoch = _parse_iso_utc(start_str)
-    except Exception as e:  # noqa: BLE001
-        print(f"  ! Erro ao consultar VOD na Kick ({type(e).__name__}: {e}).")
-        return []
 
+        uuid = m.group(1)
+        try:
+            s = requests.Session(impersonate="chrome")
+            resp = s.get(f"https://kick.com/api/v1/video/{uuid}", timeout=15)
+            if resp.status_code != 200:
+                print(f"  ! Kick API retornou HTTP {resp.status_code}; pulando chat.")
+                return []
+            meta = resp.json()
+            ls = meta.get("livestream") or {}
+            channel_id = ls.get("channel_id")
+            start_str = ls.get("start_time")
+            duration_s = float(ls.get("duration") or 0) / 1000.0 or (duration_hint or 0.0)
+            if not channel_id or not start_str or duration_s <= 0:
+                print("  ! Metadados da live Kick incompletos; pulando chat.")
+                return []
+            start_epoch = _parse_iso_utc(start_str)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! Erro ao consultar VOD na Kick ({type(e).__name__}: {e}).")
+            return []
+
+    end_s = min(duration_s, slice_end) if slice_end else duration_s
     chunk_s = 900.0  # blocos de 15 min em paralelo
-    chunks = [(start_epoch + t, min(start_epoch + t + chunk_s, start_epoch + duration_s))
-              for t in range(0, int(duration_s) + 1, int(chunk_s))]
+    chunks = [(start_epoch + t, min(start_epoch + t + chunk_s, start_epoch + end_s))
+              for t in range(int(slice_start), int(end_s) + 1, int(chunk_s))]
     seen: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=6) as pool:
         futs = [pool.submit(_kick_fetch_chunk, int(channel_id), start_epoch, cs, ce) for cs, ce in chunks]
@@ -265,13 +317,15 @@ def download_chat_downloader(url: str) -> list[dict]:
 
 
 def get_chat(platform: str, source: str, workdir: Path, cookies: str | None,
-             duration_hint: float | None = None) -> list[dict]:
+             duration_hint: float | None = None, slice_start: float = 0.0,
+             slice_end: float | None = None,
+             kick_meta: tuple[int, float, float] | None = None) -> list[dict]:
     if platform == "youtube":
         msgs = download_youtube_chat(source, workdir, cookies)
     elif platform == "twitch":
         msgs = download_chat_downloader(source)
     elif platform == "kick":
-        msgs = download_kick_chat(source, duration_hint)
+        msgs = download_kick_chat(source, duration_hint, slice_start, slice_end, kick_meta)
     elif platform == "local":
         # Aceita sidecar opcional: <video>.live_chat.json ao lado do arquivo
         p = Path(source).expanduser()
@@ -345,6 +399,76 @@ def _cd_live_chat(url: str, t0_mono: float, stop: threading.Event, out: list[dic
         pass
 
 
+def kick_live_vod(url: str) -> tuple[str, int, float, float] | None:
+    """Se o canal da Kick estiver ao vivo com VOD em andamento, retorna
+    (source_m3u8, channel_id, start_epoch, dur_s)."""
+    slug = urlparse(url).path.strip("/").split("/")[0]
+    if not slug:
+        return None
+    try:
+        from curl_cffi import requests
+        s = requests.Session(impersonate="chrome")
+        r = s.get(f"https://kick.com/api/v2/channels/{slug}/videos", timeout=15)
+        if r.status_code != 200:
+            return None
+        vids = r.json()
+        if not vids:
+            return None
+        v = vids[0]
+        src = v.get("source")
+        cid = v.get("channel_id")
+        start_str = v.get("start_time")
+        dur_s = float(v.get("duration") or 0) / 1000.0
+        start_epoch = _parse_iso_utc(str(start_str).replace(" ", "T") + "Z") if start_str else 0.0
+        if dur_s <= 0 and start_epoch > 0:
+            dur_s = max(0.0, time.time() - start_epoch)
+        if not src or not cid or not start_epoch:
+            return None
+        if v.get("is_live") or dur_s > 0:
+            return str(src), int(cid), start_epoch, dur_s
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def record_youtube_dvr(url: str, workdir: Path, minutes: float,
+                       cookies: str | None) -> Path | None:
+    """Baixa os últimos `minutes` minutos do buffer DVR de uma live ativa do YouTube."""
+    cmd = ytdlp_base(cookies) + ["-g", "-f", config.DOWNLOAD_FORMAT, "--no-playlist", url]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    stream_urls = [u.strip() for u in res.stdout.splitlines() if u.strip()]
+    if not stream_urls or ".m3u8" not in stream_urls[0]:
+        return None
+
+    seg_dur, avail_s = 5.0, minutes * 60.0
+    try:
+        import urllib.request
+        m3u8 = urllib.request.urlopen(stream_urls[0], timeout=10).read().decode("utf-8", errors="replace")
+        durs = [float(x) for x in re.findall(r"#EXTINF:([\d.]+)", m3u8)]
+        if durs:
+            avail_s = sum(durs)
+            seg_dur = avail_s / len(durs)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if avail_s < 15.0:
+        return None
+    target_s = min(minutes * 60.0, avail_s)
+    start_idx = -max(3, int(target_s / seg_dur))
+    video = workdir / config.VIDEO_NAME
+    ff_cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for u in stream_urls[:2]:
+        ff_cmd += ["-live_start_index", str(start_idx), "-i", u]
+    ff_cmd += ["-t", f"{target_s:.1f}", "-c:v", "copy", "-c:a", "aac",
+               "-movflags", "+faststart", str(video)]
+    print(f"  DVR YouTube: baixando últimos {target_s / 60:.1f} min (start_index={start_idx})...")
+    if subprocess.run(ff_cmd, timeout=max(120, target_s)).returncode != 0 or not video.exists():
+        return None
+    return video
+
+
 def record_live(platform: str, url: str, workdir: Path, minutes: float,
                 cookies: str | None) -> tuple[Path, list[dict]]:
     """Grava `minutes` minutos de uma transmissão ao vivo + chat em paralelo."""
@@ -395,16 +519,22 @@ def default_workdir(source: str) -> Path:
 
 
 def ingest(source: str, workdir: Path | None, cookies: str | None,
-           live_minutes: float | None = None) -> Path:
+           live_minutes: float | None = None, last_minutes: float | None = None,
+           section: str | None = None) -> Path:
     require_ffmpeg()
     platform = detect_platform(source)
-    print(f"[1/4] Fonte detectada: {platform}" + (f" (ao vivo {live_minutes:g} min)" if live_minutes else ""))
+    tag = (f" (ao vivo {live_minutes:g} min)" if live_minutes
+           else f" (trecho {section})" if section
+           else f" (últimos {last_minutes:g} min)" if last_minutes else "")
+    print(f"[1/4] Fonte detectada: {platform}{tag}")
 
     if workdir is None:
         workdir = default_workdir(source)
     workdir.mkdir(parents=True, exist_ok=True)
 
     live_chat: list[dict] | None = None
+    slice_start, slice_end = 0.0, None
+    kick_meta: tuple[int, float, float] | None = None
     print("[2/4] Vídeo")
     video = workdir / config.VIDEO_NAME
     if platform == "local":
@@ -413,8 +543,27 @@ def ingest(source: str, workdir: Path | None, cookies: str | None,
             shutil.copy2(src, video)
     elif live_minutes:
         video, live_chat = record_live(platform, source, workdir, live_minutes, cookies)
+    elif last_minutes and probe_duration(source, cookies) is None:
+        # Live ainda no ar: tenta voltar no tempo via VOD em andamento (Kick) ou DVR (YouTube)
+        kv = kick_live_vod(source) if platform == "kick" else None
+        if kv:
+            src_m3u8, cid, st_ep, dur_s = kv
+            kick_meta = (cid, st_ep, dur_s)
+            print(f"  Kick ao vivo -> usando m3u8 do VOD em andamento ({dur_s / 60:.0f} min decorridos)")
+            video, slice_start, slice_end = download_video(
+                src_m3u8, workdir, cookies, last_minutes, None, duration_override=dur_s)
+        elif platform == "youtube":
+            dvr = record_youtube_dvr(source, workdir, last_minutes, cookies)
+            if dvr:
+                video, live_chat = dvr, []
+            else:
+                print(f"  ! Sem buffer DVR disponível; gravando {last_minutes:g} min a partir de agora.")
+                video, live_chat = record_live(platform, source, workdir, last_minutes, cookies)
+        else:
+            print(f"  ! Stream ao vivo sem DVR; gravando {last_minutes:g} min a partir de agora.")
+            video, live_chat = record_live(platform, source, workdir, last_minutes, cookies)
     else:
-        video = download_video(source, workdir, cookies)
+        video, slice_start, slice_end = download_video(source, workdir, cookies, last_minutes, section)
 
     print("[3/4] Áudio mono 16kHz")
     wav = workdir / config.AUDIO_NAME
@@ -426,7 +575,13 @@ def ingest(source: str, workdir: Path | None, cookies: str | None,
         duration_hint = None
 
     print("[4/4] Chat")
-    chat = live_chat if live_chat is not None else get_chat(platform, source, workdir, cookies, duration_hint)
+    end_hint = slice_end or ((slice_start + duration_hint) if duration_hint else None)
+    chat = (live_chat if live_chat is not None
+            else get_chat(platform, source, workdir, cookies, end_hint, slice_start, slice_end, kick_meta))
+    if (slice_start > 0 or slice_end is not None) and chat:
+        chat = [{**m, "timestamp": round(m["timestamp"] - slice_start, 3)}
+                for m in chat
+                if m["timestamp"] >= slice_start and (slice_end is None or m["timestamp"] <= slice_end)]
     (workdir / config.CHAT_NAME).write_text(
         json.dumps(chat, ensure_ascii=False, indent=1), encoding="utf-8")
     if chat:
@@ -445,12 +600,17 @@ def main() -> None:
                     help="ex.: chrome, firefox, edge (evita bloqueios/anti-bot)")
     ap.add_argument("--live-minutes", type=float, default=None,
                     help="captura N minutos de uma live em andamento (+ chat em tempo real)")
+    ap.add_argument("--last-minutes", type=float, default=None,
+                    help="baixa apenas os últimos N minutos de um VOD (+ chat desse trecho)")
+    ap.add_argument("--section", default=None,
+                    help="baixa só um trecho do VOD, ex.: '2:00:00-5:00:00' ou '0-1:00:00'")
     config.add_common_args(ap)
     args = ap.parse_args()
     settings = config.settings_from_args(args)
 
     t0 = time.time()
-    workdir = ingest(args.source, args.workdir, args.cookies_from_browser, args.live_minutes)
+    workdir = ingest(args.source, args.workdir, args.cookies_from_browser,
+                     args.live_minutes, args.last_minutes, args.section)
     (workdir / config.META_NAME).write_text(json.dumps({
         "source": args.source,
         "topic": settings.topic,

@@ -60,21 +60,36 @@ def stage_cmd(num: int, script: str, a: argparse.Namespace, workdir: Path) -> li
             cmd += ["--cookies-from-browser", a.cookies_from_browser]
         if a.live_minutes:
             cmd += ["--live-minutes", str(a.live_minutes)]
+        if a.last_minutes:
+            cmd += ["--last-minutes", str(a.last_minutes)]
+        if a.section:
+            cmd += ["--section", a.section]
         return cmd
     if num == 4:
-        cmd = py + [str(workdir), "--ollama-model", a.ollama_model,
+        cmd = py + [str(workdir), "--backend", a.curator_backend,
+                    "--gemini-model", a.gemini_curator_model,
+                    "--ollama-model", a.ollama_model,
                     "--min-clip", str(a.min_clip), "--max-clip", str(a.max_clip)]
         return cmd + (["--topic", a.topic] if a.topic else [])
     if num == 3:
         return py + [str(workdir), "--model", a.whisper_model, "--device", a.whisper_device,
                      "--compute-type", a.whisper_compute_type]
     if num == 5:
-        return py + [str(workdir), "--max-clips", str(a.max_clips)]
+        cmd = py + [str(workdir), "--max-clips", str(a.max_clips)]
+        if a.watermark:
+            cmd += ["--watermark", "--watermark-text", a.watermark_text]
+        return cmd
     if num == 5.5:
-        cmd = py + [str(workdir), "--vision-model", a.vision_model,
+        cmd = py + [str(workdir), "--backend", a.verify_backend,
+                    "--verify-mode", a.verify_mode,
+                    "--gemini-model", a.gemini_verify_model,
+                    "--gemini-fix-model", a.gemini_curator_model,
+                    "--vision-model", a.vision_model,
                     "--min-score", str(a.min_verify_score),
                     "--ollama-model", a.ollama_model,
                     "--min-clip", str(a.min_clip), "--max-clip", str(a.max_clip)]
+        if a.watermark:
+            cmd += ["--watermark", "--watermark-text", a.watermark_text]
         return cmd + (["--topic", a.topic] if a.topic else [])
     if num == 6:
         cmd = py + [str(workdir), "--tiktok-browser", a.tiktok_browser]
@@ -148,11 +163,37 @@ def interactive_fill(a: argparse.Namespace) -> None:
         topic = Prompt.ask("Tema/jogo (Enter para pular)", default="").strip()
         a.topic = topic or None
     a.max_clips = IntPrompt.ask("Máximo de cortes", default=a.max_clips)
-    if not a.live_minutes and not Path(a.url).expanduser().is_file():
+    if not a.live_minutes and not a.last_minutes and not a.section and not Path(a.url).expanduser().is_file():
         if Confirm.ask("A live ainda está ao vivo agora?", default=False):
-            a.live_minutes = float(IntPrompt.ask("Quantos minutos capturar ao vivo?", default=30))
+            direcao = Prompt.ask(
+                "Quer os minutos para trás (últimos) ou para frente (gravar ao vivo)?",
+                choices=["tras", "frente"], default="tras",
+            )
+            if direcao == "tras":
+                val = Prompt.ask("Quantos minutos para trás? (30, 60 ou 120 minutos)", default="60").strip()
+                a.last_minutes = min(120.0, max(1.0, float(val)))
+            else:
+                val = Prompt.ask("Quantos minutos para frente? (30 ou 60 minutos)", default="30").strip()
+                a.live_minutes = min(60.0, max(1.0, float(val)))
+        else:
+            parte = Prompt.ask(
+                "Baixar o VOD inteiro ou só uma parte?",
+                choices=["inteiro", "inicio", "fim", "intervalo"], default="inteiro",
+            )
+            if parte == "inicio":
+                mins = float(Prompt.ask("Quantos minutos iniciais do VOD? (ex: 60, 120)", default="60").strip())
+                a.section = f"0-{int(mins * 60)}"
+            elif parte == "fim":
+                mins = float(Prompt.ask("Quantos minutos finais do VOD? (ex: 60, 120, 180)", default="120").strip())
+                a.last_minutes = mins
+            elif parte == "intervalo":
+                ini = Prompt.ask("Início do trecho (ex: 2:00:00)", default="0:00:00").strip()
+                fim = Prompt.ask("Fim do trecho (ex: 5:00:00)", default="3:00:00").strip()
+                a.section = f"{ini}-{fim}"
     if not a.verify:
         a.verify = Confirm.ask("Ativar verificador multimodal (VLM)?", default=False)
+    if not a.watermark:
+        a.watermark = Confirm.ask(f"Adicionar marca d'água ({a.watermark_text})?", default=False)
     if not (a.upload_yt or a.upload_tiktok or a.upload_all or a.upload_draft):
         up = Prompt.ask("Enviar rascunhos após render?", choices=["n", "yt", "tiktok", "all"], default="n")
         if up == "yt":
@@ -182,11 +223,24 @@ def main() -> None:
                     help="float16 (GPU) ou int8 (CPU)")
     ap.add_argument("--verify", action="store_true",
                     help="executa o verificador multimodal (VLM + autocorreção) após o render")
+    ap.add_argument("--watermark", action="store_true", default=config.WATERMARK_ENABLED,
+                    help="adiciona marca d'água nos cortes (desativada por padrão)")
+    ap.add_argument("--watermark-text", default=config.WATERMARK_TEXT,
+                    help=f"texto da marca d'água (padrão: {config.WATERMARK_TEXT})")
+    ap.add_argument("--curator-backend", choices=["gemini", "ollama"], default=config.CURATOR_BACKEND)
+    ap.add_argument("--verify-backend", choices=["gemini", "ollama"], default=config.VERIFY_BACKEND)
+    ap.add_argument("--verify-mode", choices=["video", "frames"], default=config.VERIFY_INPUT_MODE)
+    ap.add_argument("--gemini-curator-model", default=config.GEMINI_CURATOR_MODEL)
+    ap.add_argument("--gemini-verify-model", default=config.GEMINI_VERIFY_MODEL)
     ap.add_argument("--vision-model", default=config.OLLAMA_VISION_MODEL)
     ap.add_argument("--min-verify-score", type=float, default=config.VERIFY_MIN_SCORE)
     ap.add_argument("--cookies-from-browser", default=None, metavar="BROWSER")
     ap.add_argument("--live-minutes", type=float, default=None,
                     help="captura N minutos de uma live ainda ao vivo (+ chat em tempo real)")
+    ap.add_argument("--last-minutes", type=float, default=None,
+                    help="baixa apenas os últimos N minutos de um VOD (+ chat desse trecho)")
+    ap.add_argument("--section", default=None,
+                    help="baixa só um trecho específico do VOD (ex.: '2:00:00-5:00:00')")
     ap.add_argument("--start-at", type=int, default=1, choices=range(1, 7),
                     help="retoma a partir da etapa N (1-6) reutilizando artefatos existentes")
     config.add_common_args(ap)

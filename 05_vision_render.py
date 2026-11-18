@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import statistics
 import subprocess
@@ -141,12 +142,13 @@ def even(v: float) -> int:
     return int(v) // 2 * 2
 
 
-def _find_edge(grad_1d: np.ndarray, offset: int, from_end: bool = False) -> int | None:
-    """Encontra uma borda estática forte (ex.: moldura da webcam) em um perfil 1D."""
+def _find_edge(grad_1d: np.ndarray, offset: int, from_end: bool = False,
+               min_thresh: float = 14.0) -> int | None:
+    """Encontra uma borda estática forte (ex.: moldura ou limite da webcam) em um perfil 1D."""
     if grad_1d.size < 5:
         return None
     med = float(np.median(grad_1d))
-    thresh = max(35.0, 4.0 * med)
+    thresh = max(min_thresh, 3.0 * med)
     peaks = np.where(grad_1d >= thresh)[0]
     if peaks.size == 0:
         return None
@@ -156,23 +158,23 @@ def _find_edge(grad_1d: np.ndarray, offset: int, from_end: bool = False) -> int 
 
 
 def _find_webcam_bounds(frames: list[np.ndarray], face: dict, W: int, H: int) -> tuple[int, int, int, int]:
-    """Usa a mediana temporal dos frames para achar as bordas estáticas da webcam
-    ao redor do rosto, evitando que o recorte invada a gameplay sem espremer o rosto."""
+    """Usa persistência de bordas (percentil 30 do gradiente entre frames) para achar
+    os limites estáticos da webcam — funciona mesmo em webcams sem moldura colorida."""
     fcx, fcy = face["x"] + face["w"] / 2, face["y"] + face["h"] / 2
     fw, fh = face["w"], face["h"]
-    med = np.median([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames], axis=0).astype(np.float32)
-    gy = np.abs(cv2.Sobel(med, cv2.CV_32F, 0, 1, ksize=3))
-    gx = np.abs(cv2.Sobel(med, cv2.CV_32F, 1, 0, ksize=3))
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in frames]
+    # Borda da webcam é fixa em todos os frames; gameplay muda -> percentil 30 preserva só a webcam
+    gy = np.percentile([np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)) for g in grays], 30, axis=0)
+    gx = np.percentile([np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)) for g in grays], 30, axis=0)
 
     x_span0, x_span1 = max(0, int(fcx - fw)), min(W, int(fcx + fw))
     y_span0, y_span1 = max(0, int(fcy - 0.5 * fh)), min(H, int(fcy + 0.5 * fh))
 
-    # Começa a buscar longe o bastante do rosto para nunca confundir cabelo/óculos/ombro com borda
     top_lo = max(0, int(fcy - 2.8 * fh))
     top_hi = max(top_lo, int(fcy - 0.85 * fh))
     by1 = _find_edge(gy[top_lo:top_hi, x_span0:x_span1].mean(axis=1), top_lo, from_end=True)
 
-    bot_lo = min(H, int(fcy + 0.85 * fh))
+    bot_lo = min(H, int(fcy + 0.75 * fh))
     bot_hi = min(H, int(fcy + 3.0 * fh))
     by2 = _find_edge(gy[bot_lo:bot_hi, x_span0:x_span1].mean(axis=1), bot_lo, from_end=False)
 
@@ -191,9 +193,9 @@ def _find_webcam_bounds(frames: list[np.ndarray], face: dict, W: int, H: int) ->
     bx2 = (bx2 - pad) if bx2 is not None else W
     by2 = (by2 - pad) if by2 is not None else H
     # Garante tamanho mínimo plausível de webcam para nunca espremer o rosto
-    if bx2 - bx1 < fw * 3.2:
+    if bx2 - bx1 < fw * 2.8:
         bx1, bx2 = 0, W
-    if by2 - by1 < fh * 2.0:
+    if by2 - by1 < fh * 1.7:
         by1, by2 = 0, H
     return bx1, by1, bx2, by2
 
@@ -289,11 +291,15 @@ def clip_webcam_info(video: Path, clip: dict, global_info: dict, finder: FaceFin
         "h": statistics.median(i[3] for i in near),
     }
     bounds = global_info.get("bounds")
+    # Se o rosto se deslocou bastante em relação ao cluster global, recalcula as bordas no próprio corte
+    if not bounds or abs(face["x"] - gf["x"]) > gf["w"] * 0.6 or abs(face["y"] - gf["y"]) > gf["h"] * 0.6:
+        bounds = _find_webcam_bounds(frames, face, global_info["W"], global_info["H"])
     return {
         "mode": "split",
         "W": global_info["W"],
         "H": global_info["H"],
         "face": face,
+        "bounds": bounds,
         "top_crop": webcam_crop(face, global_info["W"], global_info["H"], bounds),
     }
 
@@ -330,7 +336,14 @@ def group_words(words: list[dict]) -> list[list[dict]]:
     return groups
 
 
-def build_ass(words: list[dict], clip_start: float, clip_end: float, y: int, path: Path) -> None:
+def _clean_hook_text(title: str) -> str:
+    """Remove emojis/símbolos fora da fonte para evitar quadrados (tofu) no libass."""
+    cleaned = re.sub(r"[^\w\sÀ-ÿ.,!?@#%&:;()\-+/\"'°ºª]", "", title or "")
+    return re.sub(r"\s+", " ", cleaned).strip().upper()
+
+
+def build_ass(words: list[dict], clip_start: float, clip_end: float, y: int, path: Path,
+              hook_title: str | None = None, mode: str = "split") -> None:
     accent = config.ACCENT_HEX.lstrip("#")
     r, g, b = (int(accent[i:i + 2], 16) for i in (0, 2, 4))
     ass_accent = f"&H{b:02X}{g:02X}{r:02X}&"  # ASS usa BGR
@@ -347,6 +360,26 @@ def build_ass(words: list[dict], clip_start: float, clip_end: float, y: int, pat
         backcolor=pysubs2.Color(0, 0, 0, 110),   # sombra suave
         outline=2, shadow=4, alignment=5, borderstyle=1,
         marginl=40, marginr=40, marginv=0)
+    # Tarja verde esmeralda (#10B981) com texto preto forte (BorderStyle=3 = caixa opaca)
+    subs.styles["HookTitle"] = pysubs2.SSAStyle(
+        fontname=config.SUB_FONT, fontsize=50, bold=True,
+        primarycolor=pysubs2.Color(10, 14, 18, 0),
+        secondarycolor=pysubs2.Color(10, 14, 18, 0),
+        outlinecolor=pysubs2.Color(r, g, b, 0),
+        backcolor=pysubs2.Color(0, 0, 0, 140),
+        outline=14, shadow=4, alignment=5, borderstyle=3,
+        marginl=70, marginr=70, marginv=0)
+
+    clean_hook = _clean_hook_text(hook_title or "")
+    if clean_hook:
+        hook_dur = min(config.HOOK_TITLE_SECONDS, max(0.5, clip_end - clip_start))
+        hy = config.HOOK_Y_SPLIT if mode == "split" else config.HOOK_Y_FALLBACK
+        subs.append(pysubs2.SSAEvent(
+            start=0,
+            end=pysubs2.make_time(s=hook_dur),
+            text=f"{{\\an5\\pos({config.OUT_WIDTH // 2},{hy})\\fad(120,250)\\fscx92\\fscy92\\t(0,120,\\fscx100\\fscy100)}}{clean_hook}",
+            style="HookTitle",
+        ))
 
     groups = group_words(words)
     for gi, grp in enumerate(groups):
@@ -371,9 +404,22 @@ def build_ass(words: list[dict], clip_start: float, clip_end: float, y: int, pat
 
 
 # =================================================================== render
-def build_filter(info: dict, ass_name: str, fonts_rel: str | None) -> str:
+def _drawtext_watermark(text: str, mode: str, fonts_rel: str | None) -> str:
+    esc = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    font_opt = ""
+    if fonts_rel and (config.FONTS_DIR / "Montserrat-ExtraBold.ttf").exists():
+        font_opt = f"fontfile={fonts_rel}/Montserrat-ExtraBold.ttf:"
+    pos = "x=w-tw-24:y=632" if mode == "split" else "x=w-tw-28:y=140"
+    return (f",drawtext={font_opt}text='{esc}':fontsize=22:fontcolor=white@0.35:"
+            f"shadowcolor=black@0.4:shadowx=1:shadowy=1:{pos}")
+
+
+def build_filter(info: dict, ass_name: str, fonts_rel: str | None,
+                 watermark: bool = config.WATERMARK_ENABLED,
+                 watermark_text: str = config.WATERMARK_TEXT) -> str:
     W, H = info["W"], info["H"]
     ass = f"ass={ass_name}" + (f":fontsdir={fonts_rel}" if fonts_rel else "")
+    wm = _drawtext_watermark(watermark_text, info["mode"], fonts_rel) if (watermark and watermark_text.strip()) else ""
     if info["mode"] == "split":
         tw, th, tx, ty = info["top_crop"]
         bw, bh, bx, by = center_crop(W, H, BOTTOM_ASPECT)
@@ -384,21 +430,25 @@ def build_filter(info: dict, ass_name: str, fonts_rel: str | None) -> str:
             f"[top][bot]vstack=inputs=2,"
             f"drawbox=x=0:y={config.TOP_HEIGHT - config.DIVIDER_PX // 2}:w={config.OUT_WIDTH}"
             f":h={config.DIVIDER_PX}:color=0x{config.ACCENT_HEX.lstrip('#')}:t=fill,"
-            f"setsar=1,{ass}[v]")
+            f"setsar=1,{ass}{wm}[v]")
     cw, ch, cx, cy = center_crop(W, H, config.OUT_WIDTH / config.OUT_HEIGHT)
     return (f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale={config.OUT_WIDTH}:{config.OUT_HEIGHT}:flags=lanczos,"
-            f"setsar=1,{ass}[v]")
+            f"setsar=1,{ass}{wm}[v]")
 
 
 def render_clip(workdir: Path, clip: dict, idx: int, info: dict,
-                words: list[dict], fonts_rel: str | None) -> Path:
+                words: list[dict], fonts_rel: str | None,
+                watermark: bool = config.WATERMARK_ENABLED,
+                watermark_text: str = config.WATERMARK_TEXT) -> Path:
     name = f"corte_{idx:02d}"
     ass_name = f"{name}.ass"
     y = config.SUB_Y if info["mode"] == "split" else config.SUB_Y_FALLBACK
-    build_ass(words, clip["start_time"], clip["end_time"], y, workdir / ass_name)
+    hook = clip.get("title") if config.HOOK_TITLE_ENABLED else None
+    build_ass(words, clip["start_time"], clip["end_time"], y, workdir / ass_name,
+              hook_title=hook, mode=info["mode"])
 
     out = workdir / f"{name}.mp4"
-    flt = build_filter(info, ass_name, fonts_rel)
+    flt = build_filter(info, ass_name, fonts_rel, watermark, watermark_text)
     base = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{clip['start_time']:.3f}", "-t", f"{clip['end_time'] - clip['start_time']:.3f}",
             "-i", config.VIDEO_NAME, "-filter_complex", flt,
@@ -421,7 +471,9 @@ def write_txt(path: Path, clip: dict) -> None:
         encoding="utf-8")
 
 
-def run_render(workdir: Path, max_clips: int) -> list[dict]:
+def run_render(workdir: Path, max_clips: int,
+               watermark: bool = config.WATERMARK_ENABLED,
+               watermark_text: str = config.WATERMARK_TEXT) -> list[dict]:
     approved_p = workdir / config.APPROVED_NAME
     trans_p = workdir / config.TRANSCRIBED_NAME
     for p in (approved_p, trans_p):
@@ -451,7 +503,7 @@ def run_render(workdir: Path, max_clips: int) -> list[dict]:
         mode_tag = "split" if c_info["mode"] == "split" else "9:16(sem webcam)"
         print(f"[{i}/{len(clips)}] corte_{i:02d} ({clip['duration']:.0f}s, {mode_tag}) {clip['title']}")
         words = clip_words(windows, clip["start_time"], clip["end_time"])
-        out = render_clip(workdir, clip, i, c_info, words, fonts_rel)
+        out = render_clip(workdir, clip, i, c_info, words, fonts_rel, watermark, watermark_text)
         write_txt(workdir / f"corte_{i:02d}.txt", clip)
         rendered.append({**clip, "file": out.name, "index": i})
     (workdir / config.RENDERED_NAME).write_text(
@@ -464,8 +516,12 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("workdir", type=Path)
     ap.add_argument("--max-clips", type=int, default=config.DEFAULT_MAX_CLIPS)
+    ap.add_argument("--watermark", action="store_true", default=config.WATERMARK_ENABLED,
+                    help="adiciona marca d'água nos cortes")
+    ap.add_argument("--watermark-text", default=config.WATERMARK_TEXT,
+                    help=f"texto da marca d'água (padrão: {config.WATERMARK_TEXT})")
     args = ap.parse_args()
-    out = run_render(args.workdir, args.max_clips)
+    out = run_render(args.workdir, args.max_clips, args.watermark, args.watermark_text)
     print(f"{len(out)} cortes renderizados em {args.workdir}")
 
 

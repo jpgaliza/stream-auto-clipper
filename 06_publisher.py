@@ -70,26 +70,40 @@ def upload_youtube_clip(service, path: Path, clip: dict) -> str:
 
 # ================================================================== TikTok
 def tiktok_caption(clip: dict) -> str:
-    tags = " ".join(clip["hashtags"])
-    caption = f"{clip['title']} {tags}".strip()
+    # Remove #shorts (YouTube) e garante tags de descoberta do TikTok
+    tags = [h for h in clip["hashtags"] if h.lower() != "#shorts"]
+    lower = {h.lower() for h in tags}
+    for extra in ("#fy", "#fyp", "#cortes"):
+        if extra not in lower:
+            tags.append(extra)
+            lower.add(extra)
+    caption = f"{clip['title']} {' '.join(tags)}".strip()
     if len(caption) > TIKTOK_CAPTION_LIMIT:
         caption = caption[:TIKTOK_CAPTION_LIMIT].rsplit(" ", 1)[0]
     return caption
 
 
 def upload_tiktok_clip(path: Path, clip: dict, browser: str, headless: bool) -> None:
-    from tiktok_uploader.upload import upload_video
+    """Roda cada upload do TikTok em subprocesso isolado para evitar conflito de
+    loop asyncio do Playwright entre chamadas sequenciais."""
+    import subprocess
 
-    # A lib devolve a lista de vídeos que FALHARAM (vazia = sucesso).
-    failed = upload_video(
-        str(path),
-        description=tiktok_caption(clip),
-        cookies=str(TIKTOK_COOKIES),
-        visibility="only_you",
-        browser=browser,
-        headless=headless,
+    payload = json.dumps({
+        "filename": str(path),
+        "description": tiktok_caption(clip),
+        "cookies": str(TIKTOK_COOKIES),
+        "visibility": "only_you",
+        "browser": browser,
+        "headless": headless,
+    })
+    code = (
+        "import json, sys; from tiktok_uploader.upload import upload_video; "
+        "kw = json.loads(sys.stdin.read()); "
+        "failed = upload_video(**kw); "
+        "sys.exit(1 if failed else 0)"
     )
-    if failed:
+    res = subprocess.run([sys.executable, "-c", code], input=payload, text=True)
+    if res.returncode != 0:
         raise RuntimeError("tiktok-uploader reportou falha no envio")
 
 

@@ -11,6 +11,12 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 # Console do Windows (cp1252) quebra com emojis nos títulos: força UTF-8 na saída.
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
@@ -26,6 +32,10 @@ TOP_HEIGHT = round(OUT_HEIGHT * TOP_RATIO)          # 672
 BOTTOM_HEIGHT = OUT_HEIGHT - TOP_HEIGHT             # 1248
 
 # ---------- Modelos ----------
+CURATOR_BACKEND = "gemini"               # "gemini" ou "ollama"
+VERIFY_BACKEND = "gemini"                # "gemini" ou "ollama"
+GEMINI_CURATOR_MODEL = "gemini-4-argon"
+GEMINI_VERIFY_MODEL = "gemini-4-hydrogen"
 OLLAMA_MODEL = "qwen3.5:9b"
 OLLAMA_HOST = "http://localhost:11434"
 WHISPER_MODEL = "large-v3"
@@ -121,8 +131,8 @@ WHISPER_DEVICE = "cuda"
 WHISPER_COMPUTE_TYPE = "float16"   # large-v3 fp16 ~ 3-4 GB VRAM
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_NUM_CTX = 8192
-TARGET_MIN_SECONDS = 35            # faixa preferida (narrativa completa)
-TARGET_MAX_SECONDS = 55
+TARGET_MIN_SECONDS = 20            # faixa padrão ágil (sem enrolação)
+TARGET_MAX_SECONDS = 35
 SNAP_TOLERANCE_SECONDS = 3.0       # quanto o corte pode andar para fechar frase
 TRANSCRIBED_NAME = "candidates_transcribed.json"
 APPROVED_NAME = "approved_clips.json"
@@ -134,6 +144,10 @@ SUB_FONT = "Montserrat ExtraBold"
 SUB_FONT_SIZE = 70
 SUB_Y = TOP_HEIGHT                 # linha divisória (672)
 SUB_Y_FALLBACK = 1344              # sem webcam não há divisória: terço inferior
+HOOK_TITLE_ENABLED = True          # título hook nos primeiros segundos
+HOOK_TITLE_SECONDS = 3.0
+HOOK_Y_SPLIT = 815                 # logo abaixo da legenda sem cobrir o centro da gameplay
+HOOK_Y_FALLBACK = 240              # zona segura superior no modo 9:16
 WEBCAM_SAMPLES = 15
 WEBCAM_MIN_FRAMES = 5              # frames mínimos com o rosto p/ aceitar o cluster
 WEBCAM_BOX_FACTOR = 4.2            # largura estimada da webcam = rosto * fator
@@ -150,5 +164,23 @@ DEFAULT_MAX_CLIPS = 15
 
 # ---------- Verificador Multimodal ----------
 OLLAMA_VISION_MODEL = "qwen2.5vl:7b"
-VERIFY_MIN_SCORE = 7.0
+VERIFY_INPUT_MODE = "video"              # "video" (.mp4 direto no Gemini) ou "frames"
+VERIFY_MIN_SCORE = 6.5
 VERIFY_SAMPLES = 6
+
+
+def make_gemini_client():
+    """Cria o cliente oficial do Gemini usando GEMINI_API_KEY do ambiente/.env."""
+    import os
+    from google import genai
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY não encontrada. Defina no arquivo .env ou como variável de ambiente."
+        )
+    return genai.Client(api_key=api_key)
+
+# ---------- Marca d'água ----------
+WATERMARK_ENABLED = False
+WATERMARK_TEXT = "@trickcut"
